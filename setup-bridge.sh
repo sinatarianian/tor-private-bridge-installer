@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+#
+# ==============================================================================
+# PRIVATE TOR BRIDGE INSTALLER (Ubuntu / Debian)
+#
+# Features:
+# - Official Tor Project repo with GPG fingerprint validation
+# - Interactive port selection (or env vars) + port conflict detection
+# - Safe UFW handling (only if active; preserves SSH by detecting sshd listeners)
+# - Hardened Tor bridge config (private, SOCKS disabled, ControlPort localhost)
+# - Prints complete obfs4 bridge line with PUBLIC IP + fingerprint
+# ==============================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- Defaults (override via env) ---
+DEFAULT_OR_PORT="${DEFAULT_OR_PORT:-9001}"
+DEFAULT_PT_PORT="${DEFAULT_PT_PORT:-54321}"
+DEFAULT_EMAIL="${DEFAULT_EMAIL:-change_me@example.com}"
+
+# --- Tor Project constants ---
+TOR_KEY_FPR_EXPECTED="A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89"
+TOR_KEY_URL="https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc"
+TOR_KEYRING="/usr/share/keyrings/tor-archive-keyring.gpg"
+TOR_LIST="/etc/apt/sources.list.d/tor.list"
+TORRC="/etc/tor/torrc"
+
+# --- File paths ---
+BRIDGE_FILE="/var/lib/tor/pt_state/obfs4_bridgeline.txt"
+TOR_FINGERPRINT_FILE="/var/lib/tor/fingerprint"
+
+# --- Colors ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."
+}
+
+is_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+prompt_value() {
+  local label="$1"
+  local def="$2"
+  local val=""
+
+  if ! is_tty; then
+    echo "$def"
+    return 0
+  fi
+
+  read -r -p "$(echo -e "${BLUE}${label} [${def}]:${NC} ")" val
+  echo "${val:-$def}"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
+}
+
+# Returns 0 if port is free, 1 if in use
+is_port_free() {
+  local port="$1"
+  # Check listening TCP sockets; compare local address column ending with :PORT
+  if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"; then
+    return 1
+  fi
+  return 0
+}
+
+validate_port() {
+  local name="$1"
+  local value="$2"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be numeric."
+  (( value >= 1025 && value <= 65535 )) || die "${name} must be between 1025-65535."
+
+  if ! is_port_free "$value"; then
+    die "Port ${value} (${name}) is already in use. Choose a different port."
+  fi
+}
+
+collect_config() {
+  echo -e "${GREEN}=== Configuration ===${NC}"
+
+  OR_PORT="${OR_PORT:-}"
+  PT_PORT="${PT_PORT:-}"
+  EMAIL="${EMAIL:-}"
+
+  if [[ -z "${OR_PORT}" ]]; then
+    OR_PORT="$(prompt_value "Tor OR_PORT (ORPort traffic)" "${DEFAULT_OR_PORT}")"
+  fi
+  validate_port "OR_PORT" "$OR_PORT"
+
+  if [[ -z "${PT_PORT}" ]]; then
+    PT_PORT="$(prompt_value "Tor PT_PORT (obfs4 transport port for Tor Browser)" "${DEFAULT_PT_PORT}")"
+  fi
+  validate_port "PT_PORT" "$PT_PORT"
+
+  [[ "$OR_PORT" != "$PT_PORT" ]] || die "OR_PORT and PT_PORT cannot be the same."
+
+  if [[ -z "${EMAIL}" ]]; then
+    EMAIL="$(prompt_value "Contact email (optional)" "${DEFAULT_EMAIL}")"
+  fi
+}
+
+install_prereqs() {
+  log "Installing prerequisites..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl gpg lsb-release apt-transport-https iproute2 >/dev/null
+}
+
+add_tor_repo() {
+  log "Setting up Tor Project APT repository..."
+  require_cmd curl
+  require_cmd gpg
+  require_cmd lsb_release
+
+  log "Downloading Tor Project signing key..."
+  local tmpkey
+  tmpkey="$(mktemp)"
+  trap 'rm -f "$tmpkey"' RETURN
+
+  curl -fsSL "$TOR_KEY_URL" -o "$tmpkey"
+
+  log "Verifying signing key fingerprint..."
+  local fpr
+  fpr="$(gpg --with-colons --show-keys "$tmpkey" | awk -F: '/^fpr:/ {print $10; exit}')"
+  [[ "$fpr" == "$TOR_KEY_FPR_EXPECTED" ]] || die "Key fingerprint mismatch. Expected $TOR_KEY_FPR_EXPECTED, got $fpr"
+
+  rm -f "$TOR_KEYRING"
+  gpg --dearmor < "$tmpkey" > "$TOR_KEYRING"
+  chmod 0644 "$TOR_KEYRING"
+
+  local codename
+  codename="$(lsb_release -cs)"
+  echo "deb [signed-by=$TOR_KEYRING] https://deb.torproject.org/torproject.org ${codename} main" > "$TOR_LIST"
+  log "Repo added for distro codename: ${codename}"
+}
+
+install_packages() {
+  log "Installing Tor, obfs4proxy and nyx..."
+  apt-get update -qq
+  apt-get install -y -qq tor obfs4proxy nyx >/dev/null
+
+  require_cmd tor
+  require_cmd obfs4proxy
+  require_cmd ss
+}
+
+backup_torrc() {
+  if [[ -f "$TORRC" ]]; then
+    local ts
+    ts="$(date +%F_%H%M%S)"
+    cp -a "$TORRC" "${TORRC}.backup.${ts}"
+    log "Backed up existing torrc to ${TORRC}.backup.${ts}"
+  fi
+}
+
+write_torrc() {
+  log "Writing Tor bridge configuration to ${TORRC}..."
+
+  cat > "$TORRC" <<EOF
+# --- Private Tor Bridge Configuration ---
+# Generated by setup-bridge.sh
+
+BridgeRelay 1
+PublishServerDescriptor 0
+
+# Obfs4 pluggable transport
+ServerTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+ServerTransportListenAddr obfs4 0.0.0.0:${PT_PORT}
+
+# Tor ORPort (not the one you paste into Tor Browser)
+ORPort ${OR_PORT}
+
+# Hardening: do not expose local SOCKS proxy
+SocksPort 0
+
+# Optional: ensure this is never an exit
+ExitPolicy reject *:*
+
+# Nyx / control port (localhost only)
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+
+# Optional contact
+ContactInfo ${EMAIL}
+
+DataDirectory /var/lib/tor
+User debian-tor
+EOF
+
+  log "Verifying Tor configuration..."
+  tor --verify-config -f "$TORRC" >/dev/null
+}
+
+get_sshd_listening_ports() {
+  # Returns unique ports where sshd is listening (best effort).
+  # If sshd isn't running or not present, returns empty.
+  ss -Hltpn 2>/dev/null \
+    | awk '/users:\(\("sshd"/ {print $4}' \
+    | sed -E 's/.*:([0-9]+)$/\1/' \
+    | grep -E '^[0-9]+$' \
+    | sort -u || true
+}
+
+ufw_rule_exists() {
+  local port="$1"
+  # Match common ufw output formats: "PORT/tcp ALLOW ..." or "PORT ALLOW ..."
+  ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${port}/tcp[[:space:]]+ALLOW"
+}
+
+configure_firewall() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    warn "UFW not installed. Ensure provider firewall allows TCP ${OR_PORT} and ${PT_PORT}."
+    return 0
+  fi
+
+  if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+    warn "UFW installed but inactive. If you enable it later, allow TCP ${OR_PORT}, ${PT_PORT} (and SSH)."
+    return 0
+  fi
+
+  log "UFW is active. Updating rules safely..."
+
+  # Preserve SSH: detect actual sshd listening ports and ensure they're allowed
+  local ssh_ports
+  ssh_ports="$(get_sshd_listening_ports || true)"
+  if [[ -n "$ssh_ports" ]]; then
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      if ! ufw_rule_exists "$p"; then
+        warn "Allowing detected SSH port ${p}/tcp in UFW to reduce lockout risk."
+        ufw allow "${p}/tcp" >/dev/null
+      fi
+    done <<< "$ssh_ports"
+  else
+    warn "Could not detect sshd listening port. SSH rules are not modified."
+  fi
+
+  # Allow bridge ports
+  if ! ufw_rule_exists "$OR_PORT"; then
+    ufw allow "${OR_PORT}/tcp" >/dev/null
+  fi
+  if ! ufw_rule_exists "$PT_PORT"; then
+    ufw allow "${PT_PORT}/tcp" >/dev/null
+  fi
+
+  log "UFW rules ensured for TCP ports: OR_PORT=${OR_PORT}, PT_PORT=${PT_PORT}"
+}
+
+restart_tor() {
+  log "Enabling and restarting Tor service..."
+  systemctl daemon-reload || true
+
+  # Stop first (avoids stale config in some cases)
+  systemctl stop tor >/dev/null 2>&1 || true
+
+  systemctl enable --now tor >/dev/null
+  systemctl restart tor
+
+  sleep 2
+  if ! systemctl is-active --quiet tor; then
+    systemctl status tor --no-pager || true
+    die "Tor failed to start. Check logs: journalctl -u tor -e"
+  fi
+}
+
+get_public_ip() {
+  local ip=""
+
+  ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="<YOUR_SERVER_PUBLIC_IP>"
+  fi
+  echo "$ip"
+}
+
+wait_for_bridge_line() {
+  log "Waiting for obfs4 bridge line to appear..."
+  local retries=60  # 60s
+  local i=0
+
+  while [[ $i -lt $retries ]]; do
+    if [[ -f "$BRIDGE_FILE" ]] && grep -q "obfs4" "$BRIDGE_FILE" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    ((i++))
+  done
+
+  return 1
+}
+
+get_tor_fingerprint() {
+  # /var/lib/tor/fingerprint usually: "nickname FINGERPRINT"
+  if [[ -f "$TOR_FINGERPRINT_FILE" ]]; then
+    awk '{print $2}' "$TOR_FINGERPRINT_FILE" | tr -d '\r'
+  else
+    echo ""
+  fi
+}
+
+render_bridge_line_for_user() {
+  local public_ip="$1"
+
+  # Grab the first obfs4 bridgeline
+  local raw
+  raw="$(grep -m1 '^Bridge obfs4 ' "$BRIDGE_FILE" 2>/dev/null || true)"
+  if [[ -z "$raw" ]]; then
+    raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
+  fi
+  [[ -n "$raw" ]] || die "Could not read obfs4 bridge line from ${BRIDGE_FILE}"
+
+  # Strip leading "Bridge "
+  local line
+  line="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
+
+  # Replace host part in IP:PT_PORT with public IP (best-effort)
+  # Expected token is field 2 (e.g., 0.0.0.0:54321)
+  local addr
+  addr="$(echo "$line" | awk '{print $2}')"
+
+  # Replace any <something>:PT_PORT with public_ip:PT_PORT
+  # This keeps cert=... and iat-mode=... intact.
+  local new_addr="${public_ip}:${PT_PORT}"
+  line="$(echo "$line" | sed -E "s#^[^ ]+[[:space:]]+[^ ]+#[obfs4-placeholder]#")" || true
+  # Rebuild safely:
+  # token1=obfs4, token2=addr, rest=from token3 onward
+  local t1 rest
+  t1="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//' | awk '{print $1}')"
+  rest="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//' | cut -d' ' -f3-)"
+  echo "${t1} ${new_addr} ${rest}"
+}
+
+extract_obfs4_fingerprint_from_line() {
+  # line: obfs4 IP:PORT FINGERPRINT cert=... iat-mode=...
+  awk '{print $3}' <<<"$1" | tr -d '\r'
+}
+
+print_result() {
+  echo -e "\n${GREEN}======================================================${NC}"
+  echo -e "${GREEN}              INSTALLATION COMPLETE                   ${NC}"
+  echo -e "${GREEN}======================================================${NC}\n"
+
+  local public_ip tor_fp
+  public_ip="$(get_public_ip)"
+  tor_fp="$(get_tor_fingerprint)"
+
+  if ! wait_for_bridge_line; then
+    warn "Bridge line not generated yet: ${BRIDGE_FILE}"
+    warn "Tor may still be bootstrapping. Check logs: sudo journalctl -u tor -e"
+    warn "Try later: sudo cat ${BRIDGE_FILE}"
+    return 0
+  fi
+
+  local user_line obfs4_fp
+  user_line="$(render_bridge_line_for_user "$public_ip")"
+  obfs4_fp="$(extract_obfs4_fingerprint_from_line "$user_line")"
+
+  echo -e "${YELLOW}Detected parameters:${NC}"
+  echo "  Public IP:         ${public_ip}"
+  echo "  OR_PORT (ORPort):  ${OR_PORT}"
+  echo "  PT_PORT (obfs4):   ${PT_PORT}"
+  [[ -n "$tor_fp" ]] && echo "  Tor Fingerprint:   ${tor_fp}" || warn "Tor fingerprint file not found yet: ${TOR_FINGERPRINT_FILE}"
+  echo "  obfs4 Fingerprint: ${obfs4_fp}"
+
+  echo -e "\n${YELLOW}Bridge Line (paste into Tor Browser):${NC}"
+  echo "----------------------------------------------------------------"
+  echo "${user_line}"
+  echo "----------------------------------------------------------------"
+  [[ "$public_ip" != "<YOUR_SERVER_PUBLIC_IP>" ]] || warn "Public IP auto-detection failed; replace placeholder with your real public IP."
+
+  echo -e "\n${BLUE}Management:${NC}"
+  echo "  • Monitor:     sudo nyx"
+  echo "  • Logs:        sudo journalctl -u tor -e"
+  echo "  • Restart:     sudo systemctl restart tor"
+  echo "  • Bridge line: sudo cat ${BRIDGE_FILE}"
+  echo "  • Ports:       sudo ss -tulpn | egrep '(:${OR_PORT}|:${PT_PORT})'"
+}
+
+main() {
+  require_root
+  collect_config
+  install_prereqs
+  add_tor_repo
+  install_packages
+  backup_torrc
+  write_torrc
+  configure_firewall
+  restart_tor
+  print_result
+}
+
+main "$@"

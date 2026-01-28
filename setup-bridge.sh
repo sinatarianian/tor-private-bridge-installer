@@ -37,7 +37,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# IMPORTANT: log/warn -> STDERR to avoid contaminating stdout captures
+# IMPORTANT: log/warn -> STDERR (prevents contaminating stdout captures)
 log()  { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
@@ -46,10 +46,7 @@ require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."; }
 is_tty() { [[ -t 0 && -t 1 ]]; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-# --- Input sanitation / validation ---
-
 trim_all_ws_and_crlf() {
-  # Remove CR/LF and ALL whitespace
   local v="$1"
   v="${v//$'\r'/}"
   v="${v//$'\n'/}"
@@ -77,7 +74,6 @@ prompt_value() {
 
 is_port_free() {
   local port="$1"
-  # Matches 0.0.0.0:PORT, [::]:PORT, 127.0.0.1:PORT, etc.
   if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"; then
     return 1
   fi
@@ -98,7 +94,7 @@ next_free_port() {
 }
 
 resolve_port() {
-  # resolve_port NAME DESIRED -> prints ONLY digits on STDOUT
+  # Prints ONLY digits on STDOUT
   local name="$1"
   local desired="$2"
 
@@ -149,7 +145,6 @@ collect_config() {
   pt_raw="${PT_PORT:-}"
   em_raw="${EMAIL:-}"
 
-  # In pipe-mode (curl | bash), stdin is not a tty → no prompt → defaults/env only
   [[ -n "$or_raw" ]] || or_raw="$DEFAULT_OR_PORT"
   [[ -n "$pt_raw" ]] || pt_raw="$DEFAULT_PT_PORT"
   [[ -n "$em_raw" ]] || em_raw="$DEFAULT_EMAIL"
@@ -329,7 +324,7 @@ get_public_ip() {
 
 wait_for_bridge_line() {
   log "Waiting for obfs4 bridge line to appear..."
-  local retries=90 i=0
+  local retries=120 i=0
   while [[ $i -lt $retries ]]; do
     if [[ -f "$BRIDGE_FILE" ]] && grep -q "obfs4" "$BRIDGE_FILE" 2>/dev/null; then
       return 0
@@ -342,29 +337,28 @@ wait_for_bridge_line() {
 
 get_tor_fingerprint() {
   if [[ -f "$TOR_FINGERPRINT_FILE" ]]; then
-    awk '{print $2}' "$TOR_FINGERPRINT_FILE" | tr -d '\r'
+    awk '{print $2}' "$TOR_FINGERPRINT_FILE" | tr -d '\r' | tr '[:lower:]' '[:upper:]'
   else
     echo ""
   fi
 }
 
-render_bridge_line_for_user() {
-  local public_ip="$1"
-  local raw stripped t1 rest
+parse_obfs4_params() {
+  # Outputs: FP<TAB>CERT<TAB>IAT
+  local raw clean fp cert iat
+  raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || { printf '\t\t\n'; return 0; }
 
-  raw="$(grep -m1 '^Bridge obfs4 ' "$BRIDGE_FILE" 2>/dev/null || true)"
-  [[ -n "$raw" ]] || raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
-  [[ -n "$raw" ]] || die "Could not read obfs4 bridge line from ${BRIDGE_FILE}"
+  clean="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
 
-  stripped="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
-  t1="$(awk '{print $1}' <<<"$stripped")"
-  rest="$(cut -d' ' -f3- <<<"$stripped")"
+  # cert and iat-mode tokens
+  cert="$(echo "$clean" | grep -oE 'cert=[^ ]+' | head -n1 || true)"
+  iat="$(echo "$clean" | grep -oE 'iat-mode=[^ ]+' | head -n1 || true)"
 
-  echo "${t1} ${public_ip}:${PT_PORT} ${rest}"
-}
+  # fingerprint (40 hex)
+  fp="$(echo "$clean" | grep -oE '[A-Fa-f0-9]{40}' | head -n1 | tr '[:lower:]' '[:upper:]' || true)"
 
-extract_obfs4_fingerprint_from_line() {
-  awk '{print $3}' <<<"$1" | tr -d '\r'
+  printf '%s\t%s\t%s\n' "$fp" "$cert" "$iat"
 }
 
 print_result() {
@@ -372,7 +366,7 @@ print_result() {
   echo -e "${GREEN}              INSTALLATION COMPLETE                   ${NC}"
   echo -e "${GREEN}======================================================${NC}\n"
 
-  local public_ip tor_fp
+  local public_ip tor_fp obfs_fp cert iat
   public_ip="$(get_public_ip)"
   tor_fp="$(get_tor_fingerprint)"
 
@@ -383,20 +377,31 @@ print_result() {
     return 0
   fi
 
-  local user_line obfs4_fp
-  user_line="$(render_bridge_line_for_user "$public_ip")"
-  obfs4_fp="$(extract_obfs4_fingerprint_from_line "$user_line")"
+  IFS=$'\t' read -r obfs_fp cert iat < <(parse_obfs4_params)
+
+  # Fallbacks
+  [[ -n "$obfs_fp" ]] || obfs_fp="$tor_fp"
+  [[ -n "$iat" ]] || iat="iat-mode=0"
+
+  if [[ -z "$cert" ]]; then
+    warn "Could not extract cert=... from ${BRIDGE_FILE}. Printing raw file for debugging:"
+    sed -n '1,120p' "$BRIDGE_FILE" >&2
+    die "Bridge line is incomplete (missing cert=...)."
+  fi
+
+  local bridge_line
+  bridge_line="obfs4 ${public_ip}:${PT_PORT} ${obfs_fp} ${cert} ${iat}"
 
   echo -e "${YELLOW}Detected parameters:${NC}"
   echo "  Public IP:         ${public_ip}"
   echo "  OR_PORT (ORPort):  ${OR_PORT}"
   echo "  PT_PORT (obfs4):   ${PT_PORT}"
-  [[ -n "$tor_fp" ]] && echo "  Tor Fingerprint:   ${tor_fp}" || warn "Tor fingerprint not found yet: ${TOR_FINGERPRINT_FILE}"
-  echo "  obfs4 Fingerprint: ${obfs4_fp}"
+  [[ -n "$tor_fp"  ]] && echo "  Tor Fingerprint:   ${tor_fp}"  || warn "Tor fingerprint not found yet: ${TOR_FINGERPRINT_FILE}"
+  [[ -n "$obfs_fp" ]] && echo "  obfs4 Fingerprint: ${obfs_fp}" || warn "obfs4 fingerprint not found."
 
   echo -e "\n${YELLOW}Bridge Line (paste into Tor Browser):${NC}"
   echo "----------------------------------------------------------------"
-  echo "${user_line}"
+  echo "${bridge_line}"
   echo "----------------------------------------------------------------"
   [[ "$public_ip" != "<YOUR_SERVER_PUBLIC_IP>" ]] || warn "Public IP detection failed; replace placeholder with your real public IP."
 

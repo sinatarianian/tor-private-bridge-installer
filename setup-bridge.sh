@@ -37,8 +37,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+# IMPORTANT: log/warn -> STDERR to avoid contaminating stdout captures
+log()  { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
 
 require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."; }
@@ -48,7 +49,7 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1";
 # --- Input sanitation / validation ---
 
 trim_all_ws_and_crlf() {
-  # Remove CR and ALL whitespace characters (spaces, tabs, newlines)
+  # Remove CR/LF and ALL whitespace
   local v="$1"
   v="${v//$'\r'/}"
   v="${v//$'\n'/}"
@@ -58,31 +59,8 @@ trim_all_ws_and_crlf() {
 
 validate_numeric_port() {
   local name="$1" value="$2"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be numeric. (Hint: when using curl|bash, set env vars: OR_PORT=9001 PT_PORT=54321)"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be numeric."
   (( value >= 1025 && value <= 65535 )) || die "${name} must be between 1025-65535."
-}
-
-# --- Port utilities ---
-
-is_port_free() {
-  local port="$1"
-  if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"; then
-    return 1
-  fi
-  return 0
-}
-
-next_free_port() {
-  local start="$1"
-  local p=$((start + 1))
-  while (( p <= 65535 )); do
-    if is_port_free "$p"; then
-      echo "$p"
-      return 0
-    fi
-    ((p++))
-  done
-  die "No free TCP port found in range ${start}-65535."
 }
 
 prompt_value() {
@@ -95,7 +73,32 @@ prompt_value() {
   printf '%s' "${val:-$def}"
 }
 
+# --- Port utilities ---
+
+is_port_free() {
+  local port="$1"
+  # Matches 0.0.0.0:PORT, [::]:PORT, 127.0.0.1:PORT, etc.
+  if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"; then
+    return 1
+  fi
+  return 0
+}
+
+next_free_port() {
+  local start="$1"
+  local p=$((start + 1))
+  while (( p <= 65535 )); do
+    if is_port_free "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
+    ((p++))
+  done
+  die "No free TCP port found in range ${start}-65535."
+}
+
 resolve_port() {
+  # resolve_port NAME DESIRED -> prints ONLY digits on STDOUT
   local name="$1"
   local desired="$2"
 
@@ -104,7 +107,7 @@ resolve_port() {
   validate_numeric_port "$name" "$desired"
 
   if is_port_free "$desired"; then
-    echo "$desired"
+    printf '%s' "$desired"
     return 0
   fi
 
@@ -115,7 +118,7 @@ resolve_port() {
       desired="$(trim_all_ws_and_crlf "$desired")"
       validate_numeric_port "$name" "$desired"
       if is_port_free "$desired"; then
-        echo "$desired"
+        printf '%s' "$desired"
         return 0
       fi
       warn "Port ${desired} is still in use."
@@ -124,53 +127,11 @@ resolve_port() {
     local picked
     picked="$(next_free_port "$desired")"
     warn "Port ${desired} (${name}) is in use. Auto-selected ${picked}."
-    echo "$picked"
+    printf '%s' "$picked"
   fi
 }
 
 # --- Main steps ---
-
-collect_config() {
-  echo -e "${GREEN}=== Configuration ===${NC}"
-
-  # IMPORTANT: In pipe-mode (curl | bash), we cannot prompt. Use defaults.
-  local or_raw pt_raw em_raw
-
-  or_raw="${OR_PORT:-}"
-  pt_raw="${PT_PORT:-}"
-  em_raw="${EMAIL:-}"
-
-  if [[ -z "$or_raw" ]]; then
-    or_raw="$DEFAULT_OR_PORT"
-    ! is_tty && log "No OR_PORT provided (non-interactive). Using default: ${or_raw}"
-  fi
-  if [[ -z "$pt_raw" ]]; then
-    pt_raw="$DEFAULT_PT_PORT"
-    ! is_tty && log "No PT_PORT provided (non-interactive). Using default: ${pt_raw}"
-  fi
-  if [[ -z "$em_raw" ]]; then
-    em_raw="$DEFAULT_EMAIL"
-    ! is_tty && log "No EMAIL provided (non-interactive). Using default: ${em_raw}"
-  fi
-
-  # If interactive, allow prompting with defaults
-  if is_tty; then
-    or_raw="$(prompt_value "Tor OR_PORT (ORPort traffic)" "$or_raw")"
-    pt_raw="$(prompt_value "Tor PT_PORT (obfs4 transport port for Tor Browser)" "$pt_raw")"
-    em_raw="$(prompt_value "Contact email (optional)" "$em_raw")"
-  fi
-
-  OR_PORT="$(resolve_port "OR_PORT" "$or_raw")"
-  PT_PORT="$(resolve_port "PT_PORT" "$pt_raw")"
-  EMAIL="$em_raw"
-
-  if [[ "$OR_PORT" == "$PT_PORT" ]]; then
-    warn "OR_PORT and PT_PORT ended up identical (${OR_PORT}). Picking a new PT_PORT..."
-    PT_PORT="$(resolve_port "PT_PORT" "$(next_free_port "$PT_PORT")")"
-  fi
-
-  log "Final ports: OR_PORT=${OR_PORT}, PT_PORT=${PT_PORT}"
-}
 
 install_prereqs() {
   log "Installing prerequisites..."
@@ -178,6 +139,39 @@ install_prereqs() {
   apt-get update -qq
   apt-get install -y -qq --no-install-recommends \
     ca-certificates curl gpg lsb-release apt-transport-https iproute2 >/dev/null
+}
+
+collect_config() {
+  echo -e "${GREEN}=== Configuration ===${NC}"
+
+  local or_raw pt_raw em_raw
+  or_raw="${OR_PORT:-}"
+  pt_raw="${PT_PORT:-}"
+  em_raw="${EMAIL:-}"
+
+  # In pipe-mode (curl | bash), stdin is not a tty → no prompt → defaults/env only
+  [[ -n "$or_raw" ]] || or_raw="$DEFAULT_OR_PORT"
+  [[ -n "$pt_raw" ]] || pt_raw="$DEFAULT_PT_PORT"
+  [[ -n "$em_raw" ]] || em_raw="$DEFAULT_EMAIL"
+
+  if is_tty; then
+    or_raw="$(prompt_value "Tor OR_PORT (ORPort traffic)" "$or_raw")"
+    pt_raw="$(prompt_value "Tor PT_PORT (obfs4 transport port for Tor Browser)" "$pt_raw")"
+    em_raw="$(prompt_value "Contact email (optional)" "$em_raw")"
+  else
+    log "Non-interactive mode detected. Using defaults/env vars."
+  fi
+
+  OR_PORT="$(resolve_port "OR_PORT" "$or_raw")"
+  PT_PORT="$(resolve_port "PT_PORT" "$pt_raw")"
+  EMAIL="$em_raw"
+
+  if [[ "$OR_PORT" == "$PT_PORT" ]]; then
+    warn "OR_PORT and PT_PORT are identical (${OR_PORT}). Picking a new PT_PORT..."
+    PT_PORT="$(resolve_port "PT_PORT" "$(next_free_port "$PT_PORT")")"
+  fi
+
+  log "Final ports: OR_PORT=${OR_PORT}, PT_PORT=${PT_PORT}"
 }
 
 add_tor_repo() {
@@ -195,6 +189,7 @@ add_tor_repo() {
   local fpr
   fpr="$(gpg --with-colons --show-keys "$tmpkey" | awk -F: '/^fpr:/ {print $10; exit}')"
   rm -f -- "$tmpkey"
+
   [[ "$fpr" == "$TOR_KEY_FPR_EXPECTED" ]] || die "Key fingerprint mismatch. Expected $TOR_KEY_FPR_EXPECTED, got $fpr"
 
   rm -f "$TOR_KEYRING"
@@ -262,6 +257,7 @@ EOF
     nl -ba "$TORRC" >&2
     die "Tor config verification failed."
   fi
+
   log "Tor configuration verified OK."
 }
 
@@ -328,7 +324,7 @@ get_public_ip() {
   ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
   [[ -n "$ip" ]] || ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
   [[ -n "$ip" ]] || ip="<YOUR_SERVER_PUBLIC_IP>"
-  echo "$ip"
+  printf '%s' "$ip"
 }
 
 wait_for_bridge_line() {
@@ -354,12 +350,12 @@ get_tor_fingerprint() {
 
 render_bridge_line_for_user() {
   local public_ip="$1"
-  local raw
+  local raw stripped t1 rest
+
   raw="$(grep -m1 '^Bridge obfs4 ' "$BRIDGE_FILE" 2>/dev/null || true)"
   [[ -n "$raw" ]] || raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
   [[ -n "$raw" ]] || die "Could not read obfs4 bridge line from ${BRIDGE_FILE}"
 
-  local stripped t1 rest
   stripped="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
   t1="$(awk '{print $1}' <<<"$stripped")"
   rest="$(cut -d' ' -f3- <<<"$stripped")"
@@ -414,8 +410,8 @@ print_result() {
 
 main() {
   require_root
-  collect_config
   install_prereqs
+  collect_config
   add_tor_repo
   install_packages
   backup_torrc

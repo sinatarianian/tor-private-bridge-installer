@@ -71,6 +71,12 @@ If you are using a cloud provider (AWS, Hetzner, DigitalOcean, etc.), ensure the
 
 ## Installation
 
+### Quick Install
+
+```bash
+curl -sL https://raw.githubusercontent.com/sinatarianian/tor-private-bridge-installer/refs/heads/main/setup-bridge.sh | sudo bash
+```
+
 ### Interactive installation
 
 Download and run the installer:

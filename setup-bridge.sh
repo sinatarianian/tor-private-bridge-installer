@@ -66,7 +66,7 @@ port_in_range_and_numeric() {
 
 is_port_free() {
   local port="$1"
-  # Best-effort robust check: look at local address column (e.g., 0.0.0.0:9001 or [::]:9001)
+  # Match 0.0.0.0:PORT, [::]:PORT, 127.0.0.1:PORT, etc.
   if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"; then
     return 1
   fi
@@ -74,7 +74,6 @@ is_port_free() {
 }
 
 next_free_port() {
-  # Find the next free port >= start+1 (wraps up to 65535)
   local start="$1"
   local p=$((start + 1))
   while (( p <= 65535 )); do
@@ -88,7 +87,6 @@ next_free_port() {
 }
 
 resolve_port() {
-  # resolve_port NAME DESIRED -> echoes a free port (may differ from desired)
   local name="$1"
   local desired="$2"
 
@@ -100,7 +98,6 @@ resolve_port() {
   fi
 
   if is_tty; then
-    # interactive: keep prompting until user enters a free port
     warn "Port ${desired} (${name}) is already in use."
     while true; do
       desired="$(prompt_value "Choose a different ${name}" "$desired")"
@@ -112,7 +109,6 @@ resolve_port() {
       warn "Port ${desired} is still in use."
     done
   else
-    # non-interactive: auto-pick next free port
     local picked
     picked="$(next_free_port "$desired")"
     warn "Port ${desired} (${name}) is in use. Auto-selected ${picked}."
@@ -135,7 +131,6 @@ collect_config() {
   [[ -n "$PT_PORT" ]] || PT_PORT="$(prompt_value "Tor PT_PORT (obfs4 transport port for Tor Browser)" "$DEFAULT_PT_PORT")"
   PT_PORT="$(resolve_port "PT_PORT" "$PT_PORT")"
 
-  # Ensure OR and PT are not identical (auto-fix if needed)
   if [[ "$OR_PORT" == "$PT_PORT" ]]; then
     warn "OR_PORT and PT_PORT ended up identical (${OR_PORT}). Picking a new PT_PORT..."
     PT_PORT="$(resolve_port "PT_PORT" "$(next_free_port "$PT_PORT")")"
@@ -161,17 +156,19 @@ add_tor_repo() {
   log "Downloading Tor Project signing key..."
   local tmpkey
   tmpkey="$(mktemp)"
-  trap 'rm -f "$tmpkey"' RETURN
 
   curl -fsSL "$TOR_KEY_URL" -o "$tmpkey"
 
   log "Verifying signing key fingerprint..."
   local fpr
   fpr="$(gpg --with-colons --show-keys "$tmpkey" | awk -F: '/^fpr:/ {print $10; exit}')"
+  rm -f -- "$tmpkey"
+
   [[ "$fpr" == "$TOR_KEY_FPR_EXPECTED" ]] || die "Key fingerprint mismatch. Expected $TOR_KEY_FPR_EXPECTED, got $fpr"
 
   rm -f "$TOR_KEYRING"
-  gpg --dearmor < "$tmpkey" > "$TOR_KEYRING"
+  # Re-download for dearmor (keeps logic simple and avoids trap issues)
+  curl -fsSL "$TOR_KEY_URL" | gpg --dearmor > "$TOR_KEYRING"
   chmod 0644 "$TOR_KEYRING"
 
   local codename
@@ -226,7 +223,13 @@ User debian-tor
 EOF
 
   log "Verifying Tor configuration..."
-  tor --verify-config -f "$TORRC" >/dev/null
+  local verify_out=""
+  if ! verify_out="$(tor --verify-config -f "$TORRC" 2>&1)"; then
+    echo "$verify_out" >&2
+    die "Tor config verification failed."
+  fi
+
+  log "Tor configuration verified OK."
 }
 
 get_sshd_listening_ports() {
@@ -261,7 +264,7 @@ configure_firewall() {
     while read -r p; do
       [[ -n "$p" ]] || continue
       if ! ufw_rule_exists "$p"; then
-        warn "Allowing detected SSH port ${p}/tcp in UFW to reduce lockout risk."
+        warn "Allowing detected SSH port ${p}/tcp to reduce lockout risk."
         ufw allow "${p}/tcp" >/dev/null
       fi
     done <<< "$ssh_ports"
@@ -284,6 +287,7 @@ restart_tor() {
 
   sleep 2
   systemctl is-active --quiet tor || die "Tor failed to start. Check: journalctl -u tor -e"
+  log "Tor service is active."
 }
 
 get_public_ip() {
@@ -296,7 +300,7 @@ get_public_ip() {
 
 wait_for_bridge_line() {
   log "Waiting for obfs4 bridge line to appear..."
-  local retries=60 i=0
+  local retries=90 i=0
   while [[ $i -lt $retries ]]; do
     if [[ -f "$BRIDGE_FILE" ]] && grep -q "obfs4" "$BRIDGE_FILE" 2>/dev/null; then
       return 0
@@ -322,12 +326,8 @@ render_bridge_line_for_user() {
   [[ -n "$raw" ]] || raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
   [[ -n "$raw" ]] || die "Could not read obfs4 bridge line from ${BRIDGE_FILE}"
 
-  # Strip "Bridge " prefix
-  local stripped
+  local stripped t1 rest
   stripped="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
-
-  # token1=obfs4, token2=addr, rest=token3..end
-  local t1 rest
   t1="$(awk '{print $1}' <<<"$stripped")"
   rest="$(cut -d' ' -f3- <<<"$stripped")"
 

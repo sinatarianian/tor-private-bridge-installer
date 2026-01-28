@@ -30,6 +30,9 @@ TORRC="/etc/tor/torrc"
 BRIDGE_FILE="/var/lib/tor/pt_state/obfs4_bridgeline.txt"
 TOR_FINGERPRINT_FILE="/var/lib/tor/fingerprint"
 
+# --- Options ---
+ENABLE_UFW=0
+
 # --- Colors ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -37,7 +40,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# IMPORTANT: log/warn -> STDERR (prevents contaminating stdout captures)
+# IMPORTANT: log/warn -> STDERR (prevents contaminating captured stdout)
 log()  { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
@@ -45,6 +48,27 @@ die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
 require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."; }
 is_tty() { [[ -t 0 && -t 1 ]]; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  setup-bridge.sh [--enable-ufw]
+
+Examples:
+  curl -sL https://.../setup-bridge.sh | sudo bash
+  curl -sL https://.../setup-bridge.sh | sudo bash -s -- --enable-ufw
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --enable-ufw) ENABLE_UFW=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown argument: $1 (use --help)" ;;
+    esac
+  done
+}
 
 trim_all_ws_and_crlf() {
   local v="$1"
@@ -257,16 +281,12 @@ EOF
 }
 
 get_sshd_listening_ports() {
+  # Detect sshd ports via ss (covers non-standard ports)
   ss -Hltpn 2>/dev/null \
     | awk '/users:\(\("sshd"/ {print $4}' \
     | sed -E 's/.*:([0-9]+)$/\1/' \
     | grep -E '^[0-9]+$' \
     | sort -u || true
-}
-
-ufw_rule_exists() {
-  local port="$1"
-  ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${port}/tcp[[:space:]]+ALLOW"
 }
 
 configure_firewall() {
@@ -275,31 +295,38 @@ configure_firewall() {
     return 0
   fi
 
-  if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-    warn "UFW installed but inactive. If enabled later, allow TCP ${OR_PORT}, ${PT_PORT} (and SSH)."
-    return 0
-  fi
-
-  log "UFW is active. Updating rules safely..."
+  # You can add rules even when ufw is inactive.
+  log "Configuring UFW rules..."
+  ufw allow 22/tcp >/dev/null || true
 
   local ssh_ports
   ssh_ports="$(get_sshd_listening_ports || true)"
   if [[ -n "$ssh_ports" ]]; then
     while read -r p; do
       [[ -n "$p" ]] || continue
-      if ! ufw_rule_exists "$p"; then
-        warn "Allowing detected SSH port ${p}/tcp to reduce lockout risk."
-        ufw allow "${p}/tcp" >/dev/null
-      fi
+      ufw allow "${p}/tcp" >/dev/null || true
     done <<< "$ssh_ports"
+    log "Allowed detected sshd ports: $(echo "$ssh_ports" | tr '\n' ' ')"
   else
-    warn "Could not detect sshd listening port. SSH rules are not modified."
+    warn "Could not detect sshd listening port(s). At minimum, 22/tcp was allowed."
   fi
 
-  if ! ufw_rule_exists "$OR_PORT"; then ufw allow "${OR_PORT}/tcp" >/dev/null; fi
-  if ! ufw_rule_exists "$PT_PORT"; then ufw allow "${PT_PORT}/tcp" >/dev/null; fi
+  ufw allow "${OR_PORT}/tcp" >/dev/null || true
+  ufw allow "${PT_PORT}/tcp" >/dev/null || true
 
-  log "UFW rules ensured for TCP: OR_PORT=${OR_PORT}, PT_PORT=${PT_PORT}"
+  # Enable only if requested
+  if [[ "$ENABLE_UFW" -eq 1 ]]; then
+    log "Enabling UFW (requested via --enable-ufw)..."
+    ufw --force enable >/dev/null
+    log "UFW enabled."
+  else
+    # Keep prior behavior: do not enable automatically
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+      log "UFW is active. Rules updated."
+    else
+      warn "UFW installed but inactive. Run: sudo ufw enable (or re-run with --enable-ufw)."
+    fi
+  fi
 }
 
 restart_tor() {
@@ -326,7 +353,7 @@ wait_for_bridge_line() {
   log "Waiting for obfs4 bridge line to appear..."
   local retries=120 i=0
   while [[ $i -lt $retries ]]; do
-    if [[ -f "$BRIDGE_FILE" ]] && grep -q "obfs4" "$BRIDGE_FILE" 2>/dev/null; then
+    if [[ -f "$BRIDGE_FILE" ]] && grep -qE '^[[:space:]]*Bridge[[:space:]]+obfs4[[:space:]]+' "$BRIDGE_FILE" 2>/dev/null; then
       return 0
     fi
     sleep 1
@@ -343,30 +370,20 @@ get_tor_fingerprint() {
   fi
 }
 
-parse_obfs4_params() {
-  # Outputs: FP<TAB>CERT<TAB>IAT
-  local raw clean fp cert iat
-  raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
-  [[ -n "$raw" ]] || { printf '\t\t\n'; return 0; }
-
-  clean="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
-
-  # cert and iat-mode tokens
-  cert="$(echo "$clean" | grep -oE 'cert=[^ ]+' | head -n1 || true)"
-  iat="$(echo "$clean" | grep -oE 'iat-mode=[^ ]+' | head -n1 || true)"
-
-  # fingerprint (40 hex)
-  fp="$(echo "$clean" | grep -oE '[A-Fa-f0-9]{40}' | head -n1 | tr '[:lower:]' '[:upper:]' || true)"
-
-  printf '%s\t%s\t%s\n' "$fp" "$cert" "$iat"
+get_bridge_line_raw() {
+  grep -m1 -E '^[[:space:]]*Bridge[[:space:]]+obfs4[[:space:]]+' "$BRIDGE_FILE" 2>/dev/null || true
 }
+
+extract_cert() { echo "$1" | grep -oE 'cert=[^ ]+' | head -n1 || true; }
+extract_iat()  { echo "$1" | grep -oE 'iat-mode=[^ ]+' | head -n1 || true; }
+extract_hex40_fingerprint() { echo "$1" | grep -oE '[A-Fa-f0-9]{40}' | head -n1 | tr '[:lower:]' '[:upper:]' || true; }
 
 print_result() {
   echo -e "\n${GREEN}======================================================${NC}"
   echo -e "${GREEN}              INSTALLATION COMPLETE                   ${NC}"
   echo -e "${GREEN}======================================================${NC}\n"
 
-  local public_ip tor_fp obfs_fp cert iat
+  local public_ip tor_fp raw stripped cert iat obfs_fp
   public_ip="$(get_public_ip)"
   tor_fp="$(get_tor_fingerprint)"
 
@@ -377,44 +394,45 @@ print_result() {
     return 0
   fi
 
-  IFS=$'\t' read -r obfs_fp cert iat < <(parse_obfs4_params)
+  raw="$(get_bridge_line_raw)"
+  [[ -n "$raw" ]] || die "Could not find 'Bridge obfs4 ...' line in ${BRIDGE_FILE}"
 
-  # Fallbacks
-  [[ -n "$obfs_fp" ]] || obfs_fp="$tor_fp"
+  stripped="$(echo "$raw" | sed -E 's/^[[:space:]]*Bridge[[:space:]]+//')"
+
+  cert="$(extract_cert "$stripped")"
+  iat="$(extract_iat "$stripped")"
+  obfs_fp="$(extract_hex40_fingerprint "$stripped")"
+
   [[ -n "$iat" ]] || iat="iat-mode=0"
+  [[ -n "$obfs_fp" ]] || obfs_fp="$tor_fp"
 
-  if [[ -z "$cert" ]]; then
-    warn "Could not extract cert=... from ${BRIDGE_FILE}. Printing raw file for debugging:"
-    sed -n '1,120p' "$BRIDGE_FILE" >&2
-    die "Bridge line is incomplete (missing cert=...)."
-  fi
+  [[ -n "$cert" ]] || die "Bridge line is incomplete (missing cert=...)."
 
-  local bridge_line
-  bridge_line="obfs4 ${public_ip}:${PT_PORT} ${obfs_fp} ${cert} ${iat}"
+  local bridge_line="obfs4 ${public_ip}:${PT_PORT} ${obfs_fp} ${cert} ${iat}"
 
   echo -e "${YELLOW}Detected parameters:${NC}"
   echo "  Public IP:         ${public_ip}"
   echo "  OR_PORT (ORPort):  ${OR_PORT}"
   echo "  PT_PORT (obfs4):   ${PT_PORT}"
-  [[ -n "$tor_fp"  ]] && echo "  Tor Fingerprint:   ${tor_fp}"  || warn "Tor fingerprint not found yet: ${TOR_FINGERPRINT_FILE}"
-  [[ -n "$obfs_fp" ]] && echo "  obfs4 Fingerprint: ${obfs_fp}" || warn "obfs4 fingerprint not found."
+  [[ -n "$tor_fp"  ]] && echo "  Tor Fingerprint:   ${tor_fp}"
+  [[ -n "$obfs_fp" ]] && echo "  obfs4 Fingerprint: ${obfs_fp}"
 
   echo -e "\n${YELLOW}Bridge Line (paste into Tor Browser):${NC}"
   echo "----------------------------------------------------------------"
   echo "${bridge_line}"
   echo "----------------------------------------------------------------"
-  [[ "$public_ip" != "<YOUR_SERVER_PUBLIC_IP>" ]] || warn "Public IP detection failed; replace placeholder with your real public IP."
 
   echo -e "\n${BLUE}Management:${NC}"
   echo "  • Monitor:     sudo nyx"
   echo "  • Logs:        sudo journalctl -u tor -e"
   echo "  • Restart:     sudo systemctl restart tor"
-  echo "  • Bridge line: sudo cat ${BRIDGE_FILE}"
+  echo "  • Bridge file: sudo cat ${BRIDGE_FILE}"
   echo "  • Ports:       sudo ss -tulpn | egrep '(:${OR_PORT}|:${PT_PORT})'"
 }
 
 main() {
   require_root
+  parse_args "$@"
   install_prereqs
   collect_config
   add_tor_repo

@@ -41,53 +41,86 @@ log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
 
-require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."
-}
-
-is_tty() {
-  [[ -t 0 && -t 1 ]]
-}
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."; }
+is_tty() { [[ -t 0 && -t 1 ]]; }
 
 prompt_value() {
-  local label="$1"
-  local def="$2"
-  local val=""
-
+  local label="$1" def="$2" val=""
   if ! is_tty; then
     echo "$def"
     return 0
   fi
-
   read -r -p "$(echo -e "${BLUE}${label} [${def}]:${NC} ")" val
   echo "${val:-$def}"
 }
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+
+# --- Port utilities ---
+
+port_in_range_and_numeric() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be numeric."
+  (( value >= 1025 && value <= 65535 )) || die "${name} must be between 1025-65535."
 }
 
-# Returns 0 if port is free, 1 if in use
 is_port_free() {
   local port="$1"
-  # Check listening TCP sockets; compare local address column ending with :PORT
-  if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"; then
+  # Best-effort robust check: look at local address column (e.g., 0.0.0.0:9001 or [::]:9001)
+  if ss -Hltpn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"; then
     return 1
   fi
   return 0
 }
 
-validate_port() {
+next_free_port() {
+  # Find the next free port >= start+1 (wraps up to 65535)
+  local start="$1"
+  local p=$((start + 1))
+  while (( p <= 65535 )); do
+    if is_port_free "$p"; then
+      echo "$p"
+      return 0
+    fi
+    ((p++))
+  done
+  die "No free TCP port found in range ${start}-65535."
+}
+
+resolve_port() {
+  # resolve_port NAME DESIRED -> echoes a free port (may differ from desired)
   local name="$1"
-  local value="$2"
+  local desired="$2"
 
-  [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be numeric."
-  (( value >= 1025 && value <= 65535 )) || die "${name} must be between 1025-65535."
+  port_in_range_and_numeric "$name" "$desired"
 
-  if ! is_port_free "$value"; then
-    die "Port ${value} (${name}) is already in use. Choose a different port."
+  if is_port_free "$desired"; then
+    echo "$desired"
+    return 0
+  fi
+
+  if is_tty; then
+    # interactive: keep prompting until user enters a free port
+    warn "Port ${desired} (${name}) is already in use."
+    while true; do
+      desired="$(prompt_value "Choose a different ${name}" "$desired")"
+      port_in_range_and_numeric "$name" "$desired"
+      if is_port_free "$desired"; then
+        echo "$desired"
+        return 0
+      fi
+      warn "Port ${desired} is still in use."
+    done
+  else
+    # non-interactive: auto-pick next free port
+    local picked
+    picked="$(next_free_port "$desired")"
+    warn "Port ${desired} (${name}) is in use. Auto-selected ${picked}."
+    echo "$picked"
   fi
 }
+
+# --- Main steps ---
 
 collect_config() {
   echo -e "${GREEN}=== Configuration ===${NC}"
@@ -96,21 +129,19 @@ collect_config() {
   PT_PORT="${PT_PORT:-}"
   EMAIL="${EMAIL:-}"
 
-  if [[ -z "${OR_PORT}" ]]; then
-    OR_PORT="$(prompt_value "Tor OR_PORT (ORPort traffic)" "${DEFAULT_OR_PORT}")"
-  fi
-  validate_port "OR_PORT" "$OR_PORT"
+  [[ -n "$OR_PORT" ]] || OR_PORT="$(prompt_value "Tor OR_PORT (ORPort traffic)" "$DEFAULT_OR_PORT")"
+  OR_PORT="$(resolve_port "OR_PORT" "$OR_PORT")"
 
-  if [[ -z "${PT_PORT}" ]]; then
-    PT_PORT="$(prompt_value "Tor PT_PORT (obfs4 transport port for Tor Browser)" "${DEFAULT_PT_PORT}")"
-  fi
-  validate_port "PT_PORT" "$PT_PORT"
+  [[ -n "$PT_PORT" ]] || PT_PORT="$(prompt_value "Tor PT_PORT (obfs4 transport port for Tor Browser)" "$DEFAULT_PT_PORT")"
+  PT_PORT="$(resolve_port "PT_PORT" "$PT_PORT")"
 
-  [[ "$OR_PORT" != "$PT_PORT" ]] || die "OR_PORT and PT_PORT cannot be the same."
-
-  if [[ -z "${EMAIL}" ]]; then
-    EMAIL="$(prompt_value "Contact email (optional)" "${DEFAULT_EMAIL}")"
+  # Ensure OR and PT are not identical (auto-fix if needed)
+  if [[ "$OR_PORT" == "$PT_PORT" ]]; then
+    warn "OR_PORT and PT_PORT ended up identical (${OR_PORT}). Picking a new PT_PORT..."
+    PT_PORT="$(resolve_port "PT_PORT" "$(next_free_port "$PT_PORT")")"
   fi
+
+  [[ -n "$EMAIL" ]] || EMAIL="$(prompt_value "Contact email (optional)" "$DEFAULT_EMAIL")"
 }
 
 install_prereqs() {
@@ -153,7 +184,6 @@ install_packages() {
   log "Installing Tor, obfs4proxy and nyx..."
   apt-get update -qq
   apt-get install -y -qq tor obfs4proxy nyx >/dev/null
-
   require_cmd tor
   require_cmd obfs4proxy
   require_cmd ss
@@ -178,24 +208,17 @@ write_torrc() {
 BridgeRelay 1
 PublishServerDescriptor 0
 
-# Obfs4 pluggable transport
 ServerTransportPlugin obfs4 exec /usr/bin/obfs4proxy
 ServerTransportListenAddr obfs4 0.0.0.0:${PT_PORT}
 
-# Tor ORPort (not the one you paste into Tor Browser)
 ORPort ${OR_PORT}
 
-# Hardening: do not expose local SOCKS proxy
 SocksPort 0
-
-# Optional: ensure this is never an exit
 ExitPolicy reject *:*
 
-# Nyx / control port (localhost only)
 ControlPort 127.0.0.1:9051
 CookieAuthentication 1
 
-# Optional contact
 ContactInfo ${EMAIL}
 
 DataDirectory /var/lib/tor
@@ -207,8 +230,6 @@ EOF
 }
 
 get_sshd_listening_ports() {
-  # Returns unique ports where sshd is listening (best effort).
-  # If sshd isn't running or not present, returns empty.
   ss -Hltpn 2>/dev/null \
     | awk '/users:\(\("sshd"/ {print $4}' \
     | sed -E 's/.*:([0-9]+)$/\1/' \
@@ -218,7 +239,6 @@ get_sshd_listening_ports() {
 
 ufw_rule_exists() {
   local port="$1"
-  # Match common ufw output formats: "PORT/tcp ALLOW ..." or "PORT ALLOW ..."
   ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${port}/tcp[[:space:]]+ALLOW"
 }
 
@@ -229,13 +249,12 @@ configure_firewall() {
   fi
 
   if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-    warn "UFW installed but inactive. If you enable it later, allow TCP ${OR_PORT}, ${PT_PORT} (and SSH)."
+    warn "UFW installed but inactive. If enabled later, allow TCP ${OR_PORT}, ${PT_PORT} (and SSH)."
     return 0
   fi
 
   log "UFW is active. Updating rules safely..."
 
-  # Preserve SSH: detect actual sshd listening ports and ensure they're allowed
   local ssh_ports
   ssh_ports="$(get_sshd_listening_ports || true)"
   if [[ -n "$ssh_ports" ]]; then
@@ -250,52 +269,34 @@ configure_firewall() {
     warn "Could not detect sshd listening port. SSH rules are not modified."
   fi
 
-  # Allow bridge ports
-  if ! ufw_rule_exists "$OR_PORT"; then
-    ufw allow "${OR_PORT}/tcp" >/dev/null
-  fi
-  if ! ufw_rule_exists "$PT_PORT"; then
-    ufw allow "${PT_PORT}/tcp" >/dev/null
-  fi
+  if ! ufw_rule_exists "$OR_PORT"; then ufw allow "${OR_PORT}/tcp" >/dev/null; fi
+  if ! ufw_rule_exists "$PT_PORT"; then ufw allow "${PT_PORT}/tcp" >/dev/null; fi
 
-  log "UFW rules ensured for TCP ports: OR_PORT=${OR_PORT}, PT_PORT=${PT_PORT}"
+  log "UFW rules ensured for TCP: OR_PORT=${OR_PORT}, PT_PORT=${PT_PORT}"
 }
 
 restart_tor() {
   log "Enabling and restarting Tor service..."
   systemctl daemon-reload || true
-
-  # Stop first (avoids stale config in some cases)
   systemctl stop tor >/dev/null 2>&1 || true
-
   systemctl enable --now tor >/dev/null
   systemctl restart tor
 
   sleep 2
-  if ! systemctl is-active --quiet tor; then
-    systemctl status tor --no-pager || true
-    die "Tor failed to start. Check logs: journalctl -u tor -e"
-  fi
+  systemctl is-active --quiet tor || die "Tor failed to start. Check: journalctl -u tor -e"
 }
 
 get_public_ip() {
   local ip=""
-
   ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
-  if [[ -z "$ip" ]]; then
-    ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
-  fi
-  if [[ -z "$ip" ]]; then
-    ip="<YOUR_SERVER_PUBLIC_IP>"
-  fi
+  [[ -n "$ip" ]] || ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
+  [[ -n "$ip" ]] || ip="<YOUR_SERVER_PUBLIC_IP>"
   echo "$ip"
 }
 
 wait_for_bridge_line() {
   log "Waiting for obfs4 bridge line to appear..."
-  local retries=60  # 60s
-  local i=0
-
+  local retries=60 i=0
   while [[ $i -lt $retries ]]; do
     if [[ -f "$BRIDGE_FILE" ]] && grep -q "obfs4" "$BRIDGE_FILE" 2>/dev/null; then
       return 0
@@ -303,12 +304,10 @@ wait_for_bridge_line() {
     sleep 1
     ((i++))
   done
-
   return 1
 }
 
 get_tor_fingerprint() {
-  # /var/lib/tor/fingerprint usually: "nickname FINGERPRINT"
   if [[ -f "$TOR_FINGERPRINT_FILE" ]]; then
     awk '{print $2}' "$TOR_FINGERPRINT_FILE" | tr -d '\r'
   else
@@ -318,38 +317,24 @@ get_tor_fingerprint() {
 
 render_bridge_line_for_user() {
   local public_ip="$1"
-
-  # Grab the first obfs4 bridgeline
   local raw
   raw="$(grep -m1 '^Bridge obfs4 ' "$BRIDGE_FILE" 2>/dev/null || true)"
-  if [[ -z "$raw" ]]; then
-    raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
-  fi
+  [[ -n "$raw" ]] || raw="$(grep -m1 'obfs4' "$BRIDGE_FILE" 2>/dev/null || true)"
   [[ -n "$raw" ]] || die "Could not read obfs4 bridge line from ${BRIDGE_FILE}"
 
-  # Strip leading "Bridge "
-  local line
-  line="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
+  # Strip "Bridge " prefix
+  local stripped
+  stripped="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//')"
 
-  # Replace host part in IP:PT_PORT with public IP (best-effort)
-  # Expected token is field 2 (e.g., 0.0.0.0:54321)
-  local addr
-  addr="$(echo "$line" | awk '{print $2}')"
-
-  # Replace any <something>:PT_PORT with public_ip:PT_PORT
-  # This keeps cert=... and iat-mode=... intact.
-  local new_addr="${public_ip}:${PT_PORT}"
-  line="$(echo "$line" | sed -E "s#^[^ ]+[[:space:]]+[^ ]+#[obfs4-placeholder]#")" || true
-  # Rebuild safely:
-  # token1=obfs4, token2=addr, rest=from token3 onward
+  # token1=obfs4, token2=addr, rest=token3..end
   local t1 rest
-  t1="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//' | awk '{print $1}')"
-  rest="$(echo "$raw" | sed -E 's/^Bridge[[:space:]]+//' | cut -d' ' -f3-)"
-  echo "${t1} ${new_addr} ${rest}"
+  t1="$(awk '{print $1}' <<<"$stripped")"
+  rest="$(cut -d' ' -f3- <<<"$stripped")"
+
+  echo "${t1} ${public_ip}:${PT_PORT} ${rest}"
 }
 
 extract_obfs4_fingerprint_from_line() {
-  # line: obfs4 IP:PORT FINGERPRINT cert=... iat-mode=...
   awk '{print $3}' <<<"$1" | tr -d '\r'
 }
 
@@ -364,7 +349,7 @@ print_result() {
 
   if ! wait_for_bridge_line; then
     warn "Bridge line not generated yet: ${BRIDGE_FILE}"
-    warn "Tor may still be bootstrapping. Check logs: sudo journalctl -u tor -e"
+    warn "Tor may still be bootstrapping. Check: sudo journalctl -u tor -e"
     warn "Try later: sudo cat ${BRIDGE_FILE}"
     return 0
   fi
@@ -377,14 +362,14 @@ print_result() {
   echo "  Public IP:         ${public_ip}"
   echo "  OR_PORT (ORPort):  ${OR_PORT}"
   echo "  PT_PORT (obfs4):   ${PT_PORT}"
-  [[ -n "$tor_fp" ]] && echo "  Tor Fingerprint:   ${tor_fp}" || warn "Tor fingerprint file not found yet: ${TOR_FINGERPRINT_FILE}"
+  [[ -n "$tor_fp" ]] && echo "  Tor Fingerprint:   ${tor_fp}" || warn "Tor fingerprint not found yet: ${TOR_FINGERPRINT_FILE}"
   echo "  obfs4 Fingerprint: ${obfs4_fp}"
 
   echo -e "\n${YELLOW}Bridge Line (paste into Tor Browser):${NC}"
   echo "----------------------------------------------------------------"
   echo "${user_line}"
   echo "----------------------------------------------------------------"
-  [[ "$public_ip" != "<YOUR_SERVER_PUBLIC_IP>" ]] || warn "Public IP auto-detection failed; replace placeholder with your real public IP."
+  [[ "$public_ip" != "<YOUR_SERVER_PUBLIC_IP>" ]] || warn "Public IP detection failed; replace placeholder with your real public IP."
 
   echo -e "\n${BLUE}Management:${NC}"
   echo "  • Monitor:     sudo nyx"
